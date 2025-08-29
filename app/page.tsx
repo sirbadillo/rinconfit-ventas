@@ -119,6 +119,33 @@ function calcularTotales(items: SaleItem[], descuentoPctManual: number, aplicaPa
   const margenPct = neto > 0 ? Math.round((margen / neto) * 1000) / 10 : 0;
   return { bruto, descuento, neto, costo, margen, margenPct };
 }
+type PedidoRow = {
+  id: UUID;
+  fecha: string;
+  cliente_id: UUID | null;
+  cliente_nombre: string | null;
+  canal: Sale["canal"];
+  afiliado_box: boolean;
+  desc_pct: number | null;
+  bruto: number;
+  descuento: number;
+  neto: number;
+  costo: number;
+  margen: number;
+  notas: string | null;
+};
+
+type DetalleRow = {
+  pedido_id: UUID;
+  producto_id: UUID;
+  producto_nombre: string;
+  tamano: string;
+  precio_unit: number;
+  costo_unit: number;
+  cantidad: number;
+};
+
+
 
 // ------------------- Data Access --------------------
 async function fetchProductsCloud(): Promise<Product[]> {
@@ -133,29 +160,42 @@ async function fetchCustomersCloud(): Promise<Customer[]> {
   if (error) throw error;
   return (data || []) as Customer[];
 }
+
 async function fetchSalesCloud(): Promise<Sale[]> {
   if (!supabase) return [];
-  const { data: pedidos, error } = await supabase
+
+  const { data: dataPedidos, error } = await supabase
     .from("pedidos")
-    .select("id, fecha, cliente_id, cliente_nombre, canal, afiliado_box, desc_pct, bruto, descuento, neto, costo, margen, notas")
+    .select(
+      "id, fecha, cliente_id, cliente_nombre, canal, afiliado_box, desc_pct, bruto, descuento, neto, costo, margen, notas"
+    )
     .order("fecha", { ascending: false });
   if (error) throw error;
-  const ids = (pedidos || []).map((p: any) => p.id);
+
+  const pedidos = (dataPedidos ?? []) as PedidoRow[];
+  const ids = pedidos.map((p) => p.id);
   if (ids.length === 0) return [];
-  const { data: det, error: err2 } = await supabase
+
+  const { data: dataDet, error: err2 } = await supabase
     .from("detalle_pedido")
-    .select("pedido_id, producto_id, producto_nombre, tamano, precio_unit, costo_unit, cantidad")
+    .select(
+      "pedido_id, producto_id, producto_nombre, tamano, precio_unit, costo_unit, cantidad"
+    )
     .in("pedido_id", ids);
   if (err2) throw err2;
-  const byPedido = new Map<string, any[]>();
-  (det || []).forEach((d: any) => {
-    const arr = byPedido.get(d.pedido_id) || [];
+
+  const det = (dataDet ?? []) as DetalleRow[];
+
+  const byPedido = new Map<string, DetalleRow[]>();
+  det.forEach((d) => {
+    const arr = byPedido.get(d.pedido_id) ?? [];
     arr.push(d);
     byPedido.set(d.pedido_id, arr);
   });
-  const sales: Sale[] = (pedidos || []).map((p: any) => {
-    const detalles = byPedido.get(p.id) || [];
-    const items: SaleItem[] = detalles.map((d: any) => ({
+
+  const sales: Sale[] = pedidos.map((p) => {
+    const detalles = byPedido.get(p.id) ?? [];
+    const items: SaleItem[] = detalles.map((d) => ({
       productId: d.producto_id,
       nombre: d.producto_nombre,
       tamano: d.tamano,
@@ -174,19 +214,24 @@ async function fetchSalesCloud(): Promise<Sale[]> {
     return {
       id: p.id,
       fechaISO: p.fecha,
-      clienteId: p.cliente_id || undefined,
-      clienteNombre: p.cliente_nombre || undefined,
+      clienteId: p.cliente_id ?? undefined,
+      clienteNombre: p.cliente_nombre ?? undefined,
       canal: p.canal,
       afiliadoBox: p.afiliado_box,
       items,
-      descuentoPctManual: p.desc_pct || 0,
+      descuentoPctManual: p.desc_pct ?? 0,
       aplicaPackEnergia: true,
       totales,
-      notas: p.notas || undefined,
-    } as Sale;
+      notas: p.notas ?? undefined,
+    };
   });
+
   return sales;
 }
+
+
+
+
 
 async function saveSaleCloud(venta: Sale) {
   if (!supabase) throw new Error("No cloud");
@@ -227,16 +272,41 @@ async function saveSaleCloud(venta: Sale) {
   if (errDet) throw errDet;
 
   // 3) Descontar stock (RPC recomendado). Si no existe RPC, hacemos update directo.
-  for (const it of venta.items) {
-    const { error: errU } = await supabase.rpc("decrement_stock", { prod_id: it.productId, qty: it.cantidad });
-    if (errU) {
-      // fallback a update directo
-      await supabase.from("productos").update({ stock: (null as any) }).eq("id", it.productId); // noop para asegurar tabla
-      await supabase.from("productos").update({ stock: supabase as any }).eq("id", it.productId); // sin-op (evita TS)
+for (const it of venta.items) {
+  const { error: errU } = await supabase.rpc("decrement_stock", {
+    prod_id: it.productId,
+    qty: it.cantidad,
+  });
+
+  if (errU) {
+    // Fallback SIN: leemos el stock actual y actualizamos
+    type StockRow = { stock: number };
+
+    const { data: prod, error: getErr } = await supabase
+      .from("productos")
+      .select("stock")
+      .eq("id", it.productId)
+      .single();
+
+    if (getErr) {
+      console.error("No se pudo leer stock para fallback:", getErr);
+      continue; // pasamos al siguiente item
+    }
+
+    const current = Number(((prod as StockRow | null)?.stock) ?? 0);
+    const newStock = Math.max(0, current - it.cantidad);
+
+    const { error: updErr } = await supabase
+      .from("productos")
+      .update({ stock: newStock })
+      .eq("id", it.productId);
+
+    if (updErr) {
+      console.error("No se pudo actualizar stock en fallback:", updErr);
     }
   }
+}
 
-  return pedidoId;
 }
 
 // ------------------- Componentes --------------------
@@ -254,7 +324,7 @@ export default function App() {
         setLoading(true);
         const [p, c, s] = await Promise.all([fetchProductsCloud(), fetchCustomersCloud(), fetchSalesCloud()]);
         setProducts(p); setCustomers(c); setSales(s);
-      } catch (e: any) {
+      } catch (e: unknown) {
         console.error(e); alert("Error cargando datos del backend");
       } finally { setLoading(false); }
     })();
@@ -381,7 +451,7 @@ function NuevaVenta({
       }
       resetForm();
       alert("Venta registrada ✅");
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error(e); alert("Error guardando la venta en el backend");
     }
   }
@@ -396,7 +466,8 @@ function NuevaVenta({
           <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             <div>
               <Label>Canal</Label>
-              <Select value={canal} onValueChange={(v: any) => setCanal(v)}>
+              <Select value={canal} onValueChange={(v) => setCanal(v as Sale["canal"])}>
+
                 <SelectTrigger><SelectValue placeholder="Seleccionar" /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="IG">Instagram</SelectItem>
@@ -598,12 +669,28 @@ function Productos({ products, setProducts }: { products: Product[]; setProducts
     if (isCloud && supabase) { await supabase.from("productos").delete().eq("id", id); const p = await fetchProductsCloud(); setProducts(p); }
     else { setProducts(products.filter((p) => p.id !== id)); }
   }
-  async function updateField(id: string, field: keyof Product, value: any) {
-    if (isCloud && supabase) {
-      await supabase.from("productos").update({ [field]: field === "activo" ? Boolean(value) : typeof value === "number" ? Number(value) : value }).eq("id", id);
-    }
-    setProducts(products.map((p) => (p.id === id ? { ...p, [field]: field === "activo" ? Boolean(value) : typeof p[field] === "number" ? Number(value) : value } : p)));
+  // Tip auxiliar para no permitir "id"
+type ProductField = Exclude<keyof Product, "id">;
+
+async function updateField<T extends ProductField>(
+  id: UUID,
+  field: T,
+  value: Product[T]
+) {
+  // Actualiza en Supabase si estás en Cloud
+  if (isCloud && supabase) {
+    await supabase
+      .from("productos")
+      .update({ [field]: value } as Partial<Product>)
+      .eq("id", id);
   }
+
+  // Refleja el cambio en el estado local
+  setProducts(products.map(p =>
+    p.id === id ? { ...p, [field]: value } : p
+  ));
+}
+
 
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -646,63 +733,167 @@ function Productos({ products, setProducts }: { products: Product[]; setProducts
   );
 }
 
-function Clientes({ customers, setCustomers }: { customers: Customer[]; setCustomers: (c: Customer[]) => void }) {
-  const [form, setForm] = useState<Omit<Customer, "id">>({ nombre: "", tipo: "B2C", contacto: "" });
+
+
+function Clientes({
+  customers,
+  setCustomers,
+}: {
+  customers: Customer[];
+  setCustomers: (c: Customer[]) => void;
+}) {
+  const [form, setForm] = useState<Omit<Customer, "id">>({
+    nombre: "",
+    tipo: "B2C",
+    contacto: "",
+  });
 
   async function add() {
     if (!form.nombre) return alert("Nombre es obligatorio");
     if (isCloud && supabase) {
       const { error } = await supabase.from("clientes").insert([{ ...form }]);
       if (error) return alert("Error al crear cliente");
-      const c = await fetchCustomersCloud(); setCustomers(c);
-    } else { setCustomers([{ id: uuid(), ...form }, ...customers]); }
+      const c = await fetchCustomersCloud();
+      setCustomers(c);
+    } else {
+      setCustomers([{ id: uuid(), ...form }, ...customers]);
+    }
     setForm({ nombre: "", tipo: "B2C", contacto: "" });
   }
+
   async function del(id: string) {
     if (!confirm("¿Eliminar cliente?")) return;
-    if (isCloud && supabase) { await supabase.from("clientes").delete().eq("id", id); const c = await fetchCustomersCloud(); setCustomers(c); }
-    else { setCustomers(customers.filter((c) => c.id !== id)); }
+    if (isCloud && supabase) {
+      await supabase.from("clientes").delete().eq("id", id);
+      const c = await fetchCustomersCloud();
+      setCustomers(c);
+    } else {
+      setCustomers(customers.filter((c) => c.id !== id));
+    }
   }
+
+  // Helper para tipar el cambio de "tipo" sin usar
+  const handleTipoCliente = (id: UUID, v: string) => {
+    setCustomers(
+      customers.map((x) =>
+        x.id === id ? { ...x, tipo: v as Customer["tipo"] } : x
+      )
+    );
+  };
 
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
       <Card>
-        <CardHeader><CardTitle>Nuevo Cliente</CardTitle></CardHeader>
+        <CardHeader>
+          <CardTitle>Nuevo Cliente</CardTitle>
+        </CardHeader>
         <CardContent className="space-y-3">
-          <div><Label>Nombre</Label><Input value={form.nombre} onChange={(e) => setForm({ ...form, nombre: e.target.value })} /></div>
-          <div><Label>Tipo</Label>
-            <Select value={form.tipo} onValueChange={(v: any) => setForm({ ...form, tipo: v })}>
-              <SelectTrigger><SelectValue placeholder="Selecciona" /></SelectTrigger>
+          <div>
+            <Label>Nombre</Label>
+            <Input
+              value={form.nombre}
+              onChange={(e) => setForm({ ...form, nombre: e.target.value })}
+            />
+          </div>
+
+          <div>
+            <Label>Tipo</Label>
+            <Select
+              value={form.tipo}
+              onValueChange={(v: string) =>
+                setForm({ ...form, tipo: v as Customer["tipo"] })
+              }
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Selecciona" />
+              </SelectTrigger>
               <SelectContent>
                 <SelectItem value="B2C">B2C</SelectItem>
                 <SelectItem value="Cafetería/Box">Cafetería/Box</SelectItem>
               </SelectContent>
             </Select>
           </div>
-          <div><Label>Contacto</Label><Input value={form.contacto} onChange={(e) => setForm({ ...form, contacto: e.target.value })} placeholder="WhatsApp/IG/email" /></div>
-          <Button className="w-full" onClick={add}><Plus className="mr-2 h-4 w-4" />Agregar</Button>
+
+          <div>
+            <Label>Contacto</Label>
+            <Input
+              value={form.contacto}
+              onChange={(e) => setForm({ ...form, contacto: e.target.value })}
+              placeholder="WhatsApp/IG/email"
+            />
+          </div>
+
+          <Button className="w-full" onClick={add}>
+            <Plus className="mr-2 h-4 w-4" />
+            Agregar
+          </Button>
         </CardContent>
       </Card>
 
       <div className="md:col-span-2 grid gap-3">
         {customers.length === 0 ? (
-          <Card><CardContent className="py-8 text-center text-neutral-500">Aún no hay clientes.</CardContent></Card>
+          <Card>
+            <CardContent className="py-8 text-center text-neutral-500">
+              Aún no hay clientes.
+            </CardContent>
+          </Card>
         ) : (
           customers.map((c) => (
             <Card key={c.id}>
               <CardContent className="grid grid-cols-1 gap-3 py-4 md:grid-cols-4">
-                <div className="md:col-span-2"><Label className="text-xs">Nombre</Label><Input value={c.nombre} onChange={(e) => setCustomers(customers.map((x) => (x.id === c.id ? { ...x, nombre: e.target.value } : x)))} /></div>
-                <div><Label className="text-xs">Tipo</Label>
-                  <Select value={c.tipo} onValueChange={(v: any) => setCustomers(customers.map((x) => (x.id === c.id ? { ...x, tipo: v } : x)))}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                <div className="md:col-span-2">
+                  <Label className="text-xs">Nombre</Label>
+                  <Input
+                    value={c.nombre}
+                    onChange={(e) =>
+                      setCustomers(
+                        customers.map((x) =>
+                          x.id === c.id ? { ...x, nombre: e.target.value } : x
+                        )
+                      )
+                    }
+                  />
+                </div>
+
+                <div>
+                  <Label className="text-xs">Tipo</Label>
+                  <Select
+                    value={c.tipo}
+                    onValueChange={(v: string) => handleTipoCliente(c.id, v)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="B2C">B2C</SelectItem>
-                      <SelectItem value="Cafetería/Box">Cafetería/Box</SelectItem>
+                      <SelectItem value="Cafetería/Box">
+                        Cafetería/Box
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
-                <div><Label className="text-xs">Contacto</Label><Input value={c.contacto || ""} onChange={(e) => setCustomers(customers.map((x) => (x.id === c.id ? { ...x, contacto: e.target.value } : x)))} /></div>
-                <div className="flex items-end justify-end"><Button variant="destructive" size="icon" onClick={() => del(c.id)}><Trash2 className="h-4 w-4" /></Button></div>
+
+                <div>
+                  <Label className="text-xs">Contacto</Label>
+                  <Input
+                    value={c.contacto || ""}
+                    onChange={(e) =>
+                      setCustomers(
+                        customers.map((x) =>
+                          x.id === c.id
+                            ? { ...x, contacto: e.target.value }
+                            : x
+                        )
+                      )
+                    }
+                  />
+                </div>
+
+                <div className="flex items-end justify-end">
+                  <Button variant="destructive" size="icon" onClick={() => del(c.id)}>
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
               </CardContent>
             </Card>
           ))
@@ -711,6 +902,18 @@ function Clientes({ customers, setCustomers }: { customers: Customer[]; setCusto
     </div>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 function Indicadores({ sales }: { sales: Sale[] }) {
   const totales = useMemo(() => {
@@ -804,14 +1007,30 @@ function Backup({ products, customers, sales, setProducts, setCustomers, setSale
 }
 
 // ------------------- Demo seed ----------------------
-async function seedDemo(products: Product[], setProducts: (p: Product[]) => void) {
-  const demo: Omit<Product, "id">[] = [
+type ProductoInsert = Omit<Product, "id">;
+
+async function seedDemo(
+  products: Product[],
+  setProducts: (p: Product[]) => void
+): Promise<void> {
+  const demo: ProductoInsert[] = [
     { sku: "RF-1KG-NAT", nombre: "Mantequilla de Maní Natural", tamano: "1 kg", precio: 9990, costo: 4228, stock: 10, activo: true },
     { sku: "RF-425G-NAT", nombre: "Mantequilla de Maní Natural", tamano: "425 g", precio: 5490, costo: 2066, stock: 20, activo: true },
   ];
+
   if (isCloud && supabase) {
-    await supabase.from("productos").insert(demo as any);
-    const p = await fetchProductsCloud(); setProducts(p);
+    const { error } = await supabase
+      .from("productos")
+      .insert<ProductoInsert>(demo);  // 👈 genérico aquí
+
+    if (error) {
+      console.error(error);
+      alert("Error al cargar la demo en la nube");
+      return;
+    }
+
+    const p = await fetchProductsCloud();
+    setProducts(p);
   } else {
     const local = demo.map((d) => ({ id: uuid(), ...d }));
     setProducts([...local, ...products]);
